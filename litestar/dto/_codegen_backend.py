@@ -179,11 +179,15 @@ class FieldAccessManager(Protocol):
 
 
 class TransferFunctionFactory:
+    # Class-level cache for transfer functions to avoid regenerating for recursive types
+    _transfer_function_cache: dict[tuple[Any, ...], Callable[[Any], Any]] = {}
+    
     def __init__(
         self,
         is_data_field: bool,
         nested_as_dict: bool,
         attribute_accessor: Callable[[object, str], Any],
+        processing_types: set[type[Any]] | None = None,
     ) -> None:
         self.attribute_accessor = attribute_accessor
         self.is_data_field = is_data_field
@@ -200,6 +204,8 @@ class TransferFunctionFactory:
         self.names: set[str] = set()
         self.nested_as_dict = nested_as_dict
         self._re_index_access = re.compile(r"\[['\"](\w+?)['\"]]")
+        # Track types being processed to detect recursion
+        self.processing_types = processing_types or set()
 
     def _add_to_fn_globals(self, name: str, value: Any) -> str:
         unique_name = unique_name_for_scope(name, self._fn_locals)
@@ -311,11 +317,13 @@ class TransferFunctionFactory:
         destination_type: type[Any],
         is_data_field: bool,
         attribute_accessor: Callable[[object, str], Any],
+        processing_types: set[type[Any]] | None = None,
     ) -> Callable[[Any], Any]:
         factory = cls(
             is_data_field=is_data_field,
             nested_as_dict=destination_type is dict,
             attribute_accessor=attribute_accessor,
+            processing_types=processing_types,
         )
         tmp_return_type_name = factory._create_local_name("tmp_return_type")
         source_instance_name = factory._create_local_name("source_instance")
@@ -335,11 +343,13 @@ class TransferFunctionFactory:
         transfer_type: TransferType,
         is_data_field: bool,
         attribute_accessor: Callable[[object, str], Any],
+        processing_types: set[type[Any]] | None = None,
     ) -> Callable[[Any], Any]:
         factory = cls(
             is_data_field=is_data_field,
             nested_as_dict=False,
             attribute_accessor=attribute_accessor,
+            processing_types=processing_types,
         )
         tmp_return_type_name = factory._create_local_name("tmp_return_type")
         source_value_name = factory._create_local_name("source_value")
@@ -360,12 +370,38 @@ class TransferFunctionFactory:
         is_data_field: bool,
         field_definition: FieldDefinition | None = None,
         attribute_accessor: Callable[[object, str], Any],
+        processing_types: set[type[Any]] | None = None,
     ) -> Callable[[Any], Any]:
+        processing_types = processing_types or set()
+        
+        # Check if we're processing a self-referential type
+        # Use the destination_type as the key to detect recursion
+        if destination_type in processing_types:
+            # For self-referential types, create a placeholder that will be replaced
+            # with the actual recursive function
+            return lambda x: x  # Placeholder that will be replaced
+        
+        # Create a cache key for this specific transfer function
+        cache_key = (
+            destination_type,
+            tuple((fd.name, fd.transfer_type.__class__.__name__) for fd in field_definitions),
+            is_data_field,
+            field_definition.annotation if field_definition else None,
+        )
+        
+        # Check if we've already created this transfer function
+        if cache_key in cls._transfer_function_cache:
+            return cls._transfer_function_cache[cache_key]
+        
+        # Add current type to processing set
+        new_processing_types = processing_types | {destination_type}
+        
         if field_definition and field_definition.is_non_string_collection:
             factory = cls(
                 is_data_field=is_data_field,
                 nested_as_dict=False,
                 attribute_accessor=attribute_accessor,
+                processing_types=new_processing_types,
             )
             source_value_name = factory._create_local_name("source_value")
             return_value_name = factory._create_local_name("tmp_return_value")
@@ -376,14 +412,19 @@ class TransferFunctionFactory:
                 source_data_name=source_value_name,
                 assignment_target=return_value_name,
             )
-            return factory._make_function(source_value_name=source_value_name, return_value_name=return_value_name)
+            result = factory._make_function(source_value_name=source_value_name, return_value_name=return_value_name)
+            cls._transfer_function_cache[cache_key] = result
+            return result
 
-        return cls.create_transfer_instance_data(
+        result = cls.create_transfer_instance_data(
             destination_type=destination_type,
             field_definitions=field_definitions,
             is_data_field=is_data_field,
             attribute_accessor=attribute_accessor,
+            processing_types=new_processing_types,
         )
+        cls._transfer_function_cache[cache_key] = result
+        return result
 
     def _create_transfer_data_body_nested(
         self,
@@ -394,22 +435,48 @@ class TransferFunctionFactory:
         assignment_target: str,
     ) -> None:
         origin_name = self._add_to_fn_globals("origin", field_definition.instantiable_origin)
-        transfer_func = TransferFunctionFactory.create_transfer_data(
-            is_data_field=self.is_data_field,
-            destination_type=destination_type,
-            field_definition=field_definition.inner_types[0],
-            field_definitions=field_definitions,
-            attribute_accessor=self.attribute_accessor,
+        
+        # Check if this is a self-referential type
+        # We need to check if the inner type is the same as the destination type
+        # AND that we're already processing this type (to detect recursion)
+        inner_field = field_definition.inner_types[0] if field_definition.inner_types else None
+        is_self_referential = (
+            inner_field and 
+            inner_field.annotation == destination_type and
+            destination_type in self.processing_types
         )
-        transfer_func_name = self._add_to_fn_globals("transfer_data", transfer_func)
-        if field_definition.is_mapping:
-            self._add_stmt(
-                f"{assignment_target} = {origin_name}((key, {transfer_func_name}(item)) for key, item in {source_data_name}.items())"
-            )
+        
+        if is_self_referential:
+            # For self-referential types, use the same function recursively
+            # This avoids generating new functions for each depth level
+            transfer_func_name = "func"  # Reference to the function being generated
+            if field_definition.is_mapping:
+                self._add_stmt(
+                    f"{assignment_target} = {origin_name}((key, {transfer_func_name}(item)) for key, item in {source_data_name}.items())"
+                )
+            else:
+                self._add_stmt(
+                    f"{assignment_target} = {origin_name}({transfer_func_name}(item) for item in {source_data_name})"
+                )
         else:
-            self._add_stmt(
-                f"{assignment_target} = {origin_name}({transfer_func_name}(item) for item in {source_data_name})"
+            # For non-self-referential types, create a separate transfer function
+            transfer_func = TransferFunctionFactory.create_transfer_data(
+                is_data_field=self.is_data_field,
+                destination_type=destination_type,
+                field_definition=field_definition.inner_types[0],
+                field_definitions=field_definitions,
+                attribute_accessor=self.attribute_accessor,
+                processing_types=self.processing_types,
             )
+            transfer_func_name = self._add_to_fn_globals("transfer_data", transfer_func)
+            if field_definition.is_mapping:
+                self._add_stmt(
+                    f"{assignment_target} = {origin_name}((key, {transfer_func_name}(item)) for key, item in {source_data_name}.items())"
+                )
+            else:
+                self._add_stmt(
+                    f"{assignment_target} = {origin_name}({transfer_func_name}(item) for item in {source_data_name})"
+                )
 
     def _create_transfer_instance_data(
         self,
@@ -534,6 +601,7 @@ class TransferFunctionFactory:
                     is_data_field=self.is_data_field,
                     transfer_type=transfer_type.inner_type,
                     attribute_accessor=self.attribute_accessor,
+                    processing_types=self.processing_types,
                 )
                 transfer_type_data_name = self._add_to_fn_globals("transfer_type_data", transfer_type_data_fn)
                 self._add_stmt(
@@ -551,6 +619,7 @@ class TransferFunctionFactory:
                     is_data_field=self.is_data_field,
                     transfer_type=transfer_type.value_type,
                     attribute_accessor=self.attribute_accessor,
+                    processing_types=self.processing_types,
                 )
                 transfer_type_data_name = self._add_to_fn_globals("transfer_type_data", transfer_type_data_fn)
                 self._add_stmt(
